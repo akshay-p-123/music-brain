@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.cache/
+cache/
+external/
+data/raw/
+data/cache/
+data/lexicons/
+data/atlases/
+*.ckpt
+*.pt
+.ipynb_checkpoints/
+.env

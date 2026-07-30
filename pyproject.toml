@@ -9,13 +9,15 @@ description = "Audio -> brain state -> emotion trajectory -> sentence and photo"
 requires-python = ">=3.11"
 dependencies = [
   "numpy",
-  "pandas",
+  "pandas<3",  # pandas 3.x is a breaking-change major bump; also what Colab's
+              # preinstalled tooling (google-colab, cudf/dask-cudf) expects
   "requests",
   "torch",
   "transformers",
   "nibabel",
   "nilearn",
   "soundfile",
+  "hnswlib",
 ]
 
 [tool.setuptools.packages.find]

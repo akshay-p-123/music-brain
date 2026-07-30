@@ -75,6 +75,18 @@ class FrozenGenerationLLM:
         if suffix_text:
             parts.append(self.embed_text(suffix_text))
         inputs_embeds = torch.cat(parts, dim=1)
+        return self.generate_from_embeds(inputs_embeds, max_new_tokens=max_new_tokens)
+
+    def generate_from_embeds(self, inputs_embeds: torch.Tensor, max_new_tokens: int = 60) -> str:
+        """Generic embeds -> text generation, deterministic (greedy).
+
+        Callers that need to assemble a prompt out of more than one soft-token
+        block (e.g. few-shot exemplars ahead of the real query, see
+        ``text_branch.py``) build the full ``inputs_embeds`` tensor themselves
+        via ``embed_text``/``interpolate_soft_tokens`` and call this directly,
+        rather than this class growing use-case-specific prompt assembly.
+        """
+        inputs_embeds = inputs_embeds.to(self.model.dtype)
         attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=self.device) #default mask for no padding
 
         with torch.inference_mode():
@@ -88,3 +100,19 @@ class FrozenGenerationLLM:
         # generate() returns only the newly produced tokens when the prompt
         # was supplied as inputs_embeds (no input_ids to prepend).
         return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+    def generate_text(self, prompt: str, temperature: float = 0.0, max_new_tokens: int = 200) -> str:
+        """Plain tokenized text generation (no soft tokens) for prompts that
+        need free-form completion rather than trajectory interpolation, e.g.
+        ``vibe_lexicon.estimate_va_via_llm``'s one-time tag->VA placement.
+        """
+        ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(self.device)
+        with torch.inference_mode():
+            output_ids = self.model.generate(
+                input_ids=ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0,
+                temperature=temperature if temperature > 0 else None,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        return self.tokenizer.decode(output_ids[0, ids.shape[1]:], skip_special_tokens=True)

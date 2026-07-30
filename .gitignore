@@ -12,3 +12,4 @@ data/atlases/
 *.pt
 .ipynb_checkpoints/
 .env
+notebooks

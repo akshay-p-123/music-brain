@@ -13,3 +13,5 @@ data/atlases/
 .ipynb_checkpoints/
 .env
 notebooks
+PROJECT_SPEC.md
+ROADMAP.md

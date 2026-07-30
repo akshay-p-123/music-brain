@@ -68,8 +68,11 @@ class WindowDataset(Dataset):
 class TrainHistory:
     train_loss: list[float] = field(default_factory=list)
     val_loss: list[float] = field(default_factory=list)
+    val_valence_r: list[float] = field(default_factory=list)
+    val_arousal_r: list[float] = field(default_factory=list)
     best_epoch: int = -1
     best_val_loss: float = float("inf")
+    best_val_corr: float = float("-inf")  # mean(valence_r, arousal_r) at best_epoch
 
 
 def train_step1(
@@ -84,19 +87,32 @@ def train_step1(
     patience: int | None = None,
     verbose: bool = True,
 ) -> tuple[FmriTrunkVA, TrainHistory]:
-    """Train the trunk + VA head, restoring the best-val-loss epoch's
-    weights before returning.
+    """Train the trunk + VA head, restoring the best-held-out-correlation
+    epoch's weights before returning.
+
+    Selection was originally by val_loss, but a full-scale run picked
+    epoch 2 of 30 as "best" -- suspicious, because Huber/MSE-style loss has
+    a specific failure mode here: a model can minimize it early just by
+    predicting something close to the per-window mean (safe, low-variance,
+    low-error) without capturing any real dynamic signal at all. Loss
+    doesn't distinguish "tracks the true trajectory" from "conservatively
+    hugs the average" -- correlation does, and correlation (not loss) is
+    what ROADMAP.md's exit criteria and verify.py's held_out_correlation
+    actually care about. So selection/early-stopping now use
+    mean(valence_r, arousal_r) on the held-out set instead, computed once
+    per epoch from the same validation forward pass already being done for
+    val_loss (no extra compute). val_loss is still tracked/logged for
+    comparison -- if loss-best and correlation-best land on very different
+    epochs, that itself is informative about whether loss was ever a good
+    proxy here.
 
     On the full-scale DEAM run (101,823 train windows), val_loss reliably
     bottomed out within the first ~5 epochs and then plateaued/got noisier
     for the remaining 25 while train_loss kept dropping -- ordinary
     overfitting once real data volume is large enough to no longer be the
-    bottleneck. Training to a fixed epoch count and keeping only the final
-    weights would silently return a measurably worse checkpoint than one
-    from partway through training, so this tracks the best val_loss seen and
-    reloads those weights at the end. Pass *patience* (epochs without a new
-    best before stopping) to also cut training short instead of always
-    running all *epochs* -- worth setting on Colab given the above.
+    bottleneck. Pass *patience* (epochs without a new best correlation
+    before stopping) to also cut training short instead of always running
+    all *epochs* -- worth setting on Colab given the above.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
@@ -128,19 +144,34 @@ def train_step1(
 
         model.eval()
         running = 0.0
+        val_preds, val_trues = [], []
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
                 pred = model(x)
                 running += loss_fn(pred, y).item() * len(x)
+                val_preds.append(pred.cpu().numpy())
+                val_trues.append(y.cpu().numpy())
         val_loss = running / len(val_ds)
+        val_preds = np.concatenate(val_preds)
+        val_trues = np.concatenate(val_trues)
+        valence_r = float(np.corrcoef(val_preds[:, 0], val_trues[:, 0])[0, 1])
+        arousal_r = float(np.corrcoef(val_preds[:, 1], val_trues[:, 1])[0, 1])
+        mean_corr = float(np.nanmean([valence_r, arousal_r]))
 
         history.train_loss.append(train_loss)
         history.val_loss.append(val_loss)
+        history.val_valence_r.append(valence_r)
+        history.val_arousal_r.append(arousal_r)
         if verbose:
-            print(f"[train] epoch {epoch + 1}/{epochs}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
+            print(
+                f"[train] epoch {epoch + 1}/{epochs}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+                f"val_valence_r={valence_r:+.3f}  val_arousal_r={arousal_r:+.3f}"
+            )
 
-        if val_loss < history.best_val_loss:
+        improved = not np.isnan(mean_corr) and mean_corr > history.best_val_corr
+        if improved:
+            history.best_val_corr = mean_corr
             history.best_val_loss = val_loss
             history.best_epoch = epoch + 1
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -149,13 +180,16 @@ def train_step1(
             epochs_since_best += 1
             if patience is not None and epochs_since_best >= patience:
                 if verbose:
-                    print(f"[train] no val_loss improvement for {patience} epochs, stopping early at epoch {epoch + 1}")
+                    print(f"[train] no val correlation improvement for {patience} epochs, stopping early at epoch {epoch + 1}")
                 break
 
     if best_state is not None:
         model.load_state_dict(best_state)
         if verbose:
-            print(f"[train] restored best checkpoint: epoch {history.best_epoch}  val_loss={history.best_val_loss:.4f}")
+            print(
+                f"[train] restored best checkpoint: epoch {history.best_epoch}  "
+                f"val_loss={history.best_val_loss:.4f}  mean_val_corr={history.best_val_corr:+.3f}"
+            )
 
     return model, history
 

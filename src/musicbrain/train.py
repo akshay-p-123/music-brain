@@ -68,6 +68,8 @@ class WindowDataset(Dataset):
 class TrainHistory:
     train_loss: list[float] = field(default_factory=list)
     val_loss: list[float] = field(default_factory=list)
+    best_epoch: int = -1
+    best_val_loss: float = float("inf")
 
 
 def train_step1(
@@ -79,8 +81,23 @@ def train_step1(
     weight_decay: float = 1e-4,
     device: str | None = None,
     seed: int = 0,
+    patience: int | None = None,
     verbose: bool = True,
 ) -> tuple[FmriTrunkVA, TrainHistory]:
+    """Train the trunk + VA head, restoring the best-val-loss epoch's
+    weights before returning.
+
+    On the full-scale DEAM run (101,823 train windows), val_loss reliably
+    bottomed out within the first ~5 epochs and then plateaued/got noisier
+    for the remaining 25 while train_loss kept dropping -- ordinary
+    overfitting once real data volume is large enough to no longer be the
+    bottleneck. Training to a fixed epoch count and keeping only the final
+    weights would silently return a measurably worse checkpoint than one
+    from partway through training, so this tracks the best val_loss seen and
+    reloads those weights at the end. Pass *patience* (epochs without a new
+    best before stopping) to also cut training short instead of always
+    running all *epochs* -- worth setting on Colab given the above.
+    """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
 
@@ -92,6 +109,9 @@ def train_step1(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     history = TrainHistory()
+
+    best_state: dict[str, torch.Tensor] | None = None
+    epochs_since_best = 0
 
     for epoch in range(epochs):
         model.train()
@@ -119,6 +139,23 @@ def train_step1(
         history.val_loss.append(val_loss)
         if verbose:
             print(f"[train] epoch {epoch + 1}/{epochs}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
+
+        if val_loss < history.best_val_loss:
+            history.best_val_loss = val_loss
+            history.best_epoch = epoch + 1
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            epochs_since_best = 0
+        else:
+            epochs_since_best += 1
+            if patience is not None and epochs_since_best >= patience:
+                if verbose:
+                    print(f"[train] no val_loss improvement for {patience} epochs, stopping early at epoch {epoch + 1}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        if verbose:
+            print(f"[train] restored best checkpoint: epoch {history.best_epoch}  val_loss={history.best_val_loss:.4f}")
 
     return model, history
 

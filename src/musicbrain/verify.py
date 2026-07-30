@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from musicbrain.train import WindowDataset
+from musicbrain.train import ClipSequenceDataset, WindowDataset
 
 
 @dataclass
@@ -89,3 +89,53 @@ def summarize_tracking(results: list[ClipTrackingResult]) -> dict[str, float]:
         "n_clips_scored": len(v),
         "n_clips_total": len(results),
     }
+
+
+def _predict_temporal(model, ds: ClipSequenceDataset, device=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run ``TemporalFmriTrunkVA`` clip-by-clip -- its forward pass needs a
+    whole clip's ordered window sequence at once (see model.py), unlike
+    ``WindowDataset``'s flat, shuffled pool. Returns pooled
+    ``(preds, trues, song_id_per_window)`` in the same flattened shape
+    ``held_out_correlation``/``within_clip_tracking`` already use, so the
+    *_temporal variants below reuse identical correlation logic and the
+    same ``HeldOutCorrelation``/``ClipTrackingResult`` dataclasses --
+    numbers from both models are directly comparable.
+    """
+    device = device or next(model.parameters()).device
+    model.eval()
+    preds, trues, song_ids = [], [], []
+    with torch.no_grad():
+        for i in range(len(ds)):
+            song_id = ds.song_ids[i]
+            x, y = ds[i]
+            pred = model(x.unsqueeze(0).to(device)).squeeze(0).cpu().numpy()
+            preds.append(pred)
+            trues.append(y.numpy())
+            song_ids.extend([song_id] * len(pred))
+    return np.concatenate(preds), np.concatenate(trues), np.array(song_ids, dtype=np.int64)
+
+
+def held_out_correlation_temporal(model, val_ds: ClipSequenceDataset, device=None) -> HeldOutCorrelation:
+    pred, true, _ = _predict_temporal(model, val_ds, device)
+    return HeldOutCorrelation(
+        valence_r=float(np.corrcoef(pred[:, 0], true[:, 0])[0, 1]),
+        arousal_r=float(np.corrcoef(pred[:, 1], true[:, 1])[0, 1]),
+        n_windows=len(true),
+    )
+
+
+def within_clip_tracking_temporal(
+    model, val_ds: ClipSequenceDataset, device=None, min_windows: int = 4
+) -> list[ClipTrackingResult]:
+    pred, true, song_id_per_window = _predict_temporal(model, val_ds, device)
+    results = []
+    for song_id in sorted(set(song_id_per_window.tolist())):
+        mask = song_id_per_window == song_id
+        n = int(mask.sum())
+        if n < min_windows:
+            results.append(ClipTrackingResult(song_id, n, None, None))
+            continue
+        v_r = float(np.corrcoef(pred[mask, 0], true[mask, 0])[0, 1])
+        a_r = float(np.corrcoef(pred[mask, 1], true[mask, 1])[0, 1])
+        results.append(ClipTrackingResult(song_id, n, v_r, a_r))
+    return results

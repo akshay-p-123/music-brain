@@ -93,3 +93,44 @@ class FmriTrunkVA(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.va_head(self.trunk(x))
+
+
+class TemporalFmriTrunkVA(nn.Module):
+    """Trunk + a bidirectional-GRU temporal mixer + VA head -- contrast
+    ``FmriTrunkVA`` above, which has *no* mechanism to use neighboring
+    windows' context at all (ROADMAP.md Phase 1: full-scale run got decent
+    pooled held-out correlation, valence r=0.43/arousal r=0.64, but weak
+    within-clip tracking, mean r=0.11/0.18 -- a signature consistent with
+    that architectural gap, not a training-loop artifact).
+
+    Same per-window feature extractor (``FmriTrunk``, unchanged) applied
+    independently to every window first, exactly as before. The only
+    architectural addition is a GRU run *across* a clip's full window
+    sequence on top of those per-window features, before the VA head --
+    so each window's final VA prediction can now depend on what came
+    before/after it in the same clip, which the baseline model cannot do
+    even in principle.
+
+    Operates on one whole clip's window sequence per forward call (shape
+    ``(B, T, P)``, ``T`` = that clip's window count), not a flattened pool
+    of independent windows -- see ``train.ClipSequenceDataset``/
+    ``train_step1_temporal``, which is why this needs its own training
+    loop rather than reusing ``train_step1``.
+    """
+
+    def __init__(self, n_parcels: int = 400, width: int = 512, n_blocks: int = 2, gru_hidden: int = 128):
+        super().__init__()
+        self.trunk = FmriTrunk(n_parcels=n_parcels, width=width, n_blocks=n_blocks)
+        self.temporal = nn.GRU(
+            input_size=width, hidden_size=gru_hidden, num_layers=1, batch_first=True, bidirectional=True
+        )
+        self.va_head = VAHead(width=2 * gru_hidden)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, P), one or more whole clips' window sequences (equal
+        T within a batch; see ClipSequenceDataset for why batches are
+        single-clip in the current prototype). Output: (B, T, 2)."""
+        B, T, P = x.shape
+        h = self.trunk(x.reshape(B * T, P)).reshape(B, T, -1)  # per-window features, same as FmriTrunkVA
+        h, _ = self.temporal(h)  # mix across time within each clip
+        return self.va_head(h)

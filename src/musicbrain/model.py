@@ -111,11 +111,16 @@ class TemporalFmriTrunkVA(nn.Module):
     before/after it in the same clip, which the baseline model cannot do
     even in principle.
 
-    Operates on one whole clip's window sequence per forward call (shape
-    ``(B, T, P)``, ``T`` = that clip's window count), not a flattened pool
-    of independent windows -- see ``train.ClipSequenceDataset``/
+    Operates on one or more whole clips' window sequences per forward call
+    (shape ``(B, T, P)``; see ``train.ClipSequenceDataset``/
     ``train_step1_temporal``, which is why this needs its own training
-    loop rather than reusing ``train_step1``.
+    loop rather than reusing ``train_step1``). A first one-clip-per-step
+    (no batching) prototype trained noisily and underperformed the
+    baseline on both pooled and within-clip correlation -- pass *lengths*
+    (each clip's real, unpadded window count within the batch) so multiple
+    variable-length clips can be padded together and batched properly via
+    ``pack_padded_sequence``/``pad_packed_sequence`` instead, without the
+    GRU's backward direction being corrupted by padding.
     """
 
     def __init__(self, n_parcels: int = 400, width: int = 512, n_blocks: int = 2, gru_hidden: int = 128):
@@ -126,11 +131,20 @@ class TemporalFmriTrunkVA(nn.Module):
         )
         self.va_head = VAHead(width=2 * gru_hidden)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, P), one or more whole clips' window sequences (equal
-        T within a batch; see ClipSequenceDataset for why batches are
-        single-clip in the current prototype). Output: (B, T, 2)."""
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """x: (B, T, P) -- T is the batch's *padded* max window count when
+        *lengths* is given (real per-clip window counts), or exactly one
+        clip's own window count when *lengths* is None (single-clip call,
+        e.g. from verify.py's per-clip evaluation loop). Output: (B, T, 2)
+        -- padded positions are garbage (unmasked), callers must mask them
+        out using the same *lengths*/mask before computing loss or
+        correlation (see train.collate_clips)."""
         B, T, P = x.shape
         h = self.trunk(x.reshape(B * T, P)).reshape(B, T, -1)  # per-window features, same as FmriTrunkVA
-        h, _ = self.temporal(h)  # mix across time within each clip
+        if lengths is not None:
+            packed = nn.utils.rnn.pack_padded_sequence(h, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            packed_out, _ = self.temporal(packed)
+            h, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=T)
+        else:
+            h, _ = self.temporal(h)  # single clip, no padding to worry about
         return self.va_head(h)

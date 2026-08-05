@@ -220,32 +220,63 @@ def train_step1(
     return model, history
 
 
+def collate_clips(
+    batch: list[tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad a batch of variable-length ``(trace[T_i, P], va[T_i, 2])`` clips
+    to the batch's own max ``T``, for ``DataLoader(..., collate_fn=...)``.
+
+    Returns ``(x, y, lengths, mask)``: ``lengths`` (each clip's real,
+    unpadded window count) is what ``TemporalFmriTrunkVA.forward`` needs
+    for ``pack_padded_sequence`` so the GRU isn't corrupted by padding;
+    ``mask`` (bool, ``(B, T_max)``) marks real vs. padded positions so
+    loss/correlation computation can exclude the padding.
+    """
+    traces, vas = zip(*batch)
+    lengths = torch.tensor([t.shape[0] for t in traces], dtype=torch.long)
+    T_max = int(lengths.max())
+    B, P = len(traces), traces[0].shape[1]
+
+    x = torch.zeros(B, T_max, P, dtype=traces[0].dtype)
+    y = torch.zeros(B, T_max, 2, dtype=vas[0].dtype)
+    mask = torch.zeros(B, T_max, dtype=torch.bool)
+    for i, (trace, va) in enumerate(zip(traces, vas)):
+        t = trace.shape[0]
+        x[i, :t] = trace
+        y[i, :t] = va
+        mask[i, :t] = True
+    return x, y, lengths, mask
+
+
 def train_step1_temporal(
     train_ds: ClipSequenceDataset,
     val_ds: ClipSequenceDataset,
     epochs: int = 30,
+    batch_size: int = 16,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     gru_hidden: int = 128,
+    grad_clip_norm: float | None = 5.0,
     device: str | None = None,
     seed: int = 0,
     patience: int | None = None,
     verbose: bool = True,
 ) -> tuple[TemporalFmriTrunkVA, TrainHistory]:
-    """Train ``TemporalFmriTrunkVA``. Mirrors ``train_step1``'s overall
-    shape (correlation-based checkpoint selection, optional early
-    stopping, same ``TrainHistory``) but iterates **one clip per gradient
-    step** rather than shuffled batches of independent windows, since
-    clips vary in length and the model needs each clip's full, ordered
-    window sequence in one forward pass to actually use temporal context.
+    """Train ``TemporalFmriTrunkVA`` with proper cross-clip batching.
 
-    This is a prototype-stage simplification, not necessarily the final
-    training-throughput shape: no cross-clip batching/padding, so this
-    will be slower per epoch than ``train_step1`` at equivalent data
-    volume (more, smaller optimizer steps, less GPU parallelism per step).
-    Worth revisiting (pad+mask to batch multiple clips together) only if
-    this architecture's within-clip tracking numbers actually justify the
-    added complexity.
+    Mirrors ``train_step1``'s overall shape (correlation-based checkpoint
+    selection, optional early stopping, same ``TrainHistory``). A first
+    prototype trained one clip per gradient step (no batching) and
+    underperformed the i.i.d. baseline on both pooled and within-clip
+    correlation, with a training curve that stopped after only 11 epochs
+    and at least one clip collapsing to a constant (zero-variance)
+    prediction -- signs of an under-optimized, noisy training regime
+    (batch size effectively 1) rather than proof the architecture itself
+    doesn't help. This version batches multiple variable-length clips
+    together via padding + masking (``collate_clips``,
+    ``pack_padded_sequence`` inside the model) for a fairer optimization
+    comparison, plus gradient clipping (*grad_clip_norm*) since GRUs over
+    long sequences are prone to exactly the instability observed before.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
@@ -253,43 +284,43 @@ def train_step1_temporal(
     n_parcels = train_ds[0][0].shape[-1]
     model = TemporalFmriTrunkVA(n_parcels=n_parcels, gru_hidden=gru_hidden).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_fn = torch.nn.HuberLoss()
+    loss_fn = torch.nn.HuberLoss(reduction="none")
 
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_clips)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_clips)
     history = TrainHistory()
     best_state: dict[str, torch.Tensor] | None = None
     epochs_since_best = 0
 
-    order = list(range(len(train_ds)))
-    shuffler = random.Random(seed)
-
     for epoch in range(epochs):
         model.train()
-        shuffler.shuffle(order)
         running, n_windows = 0.0, 0
-        for idx in order:
-            x, y = train_ds[idx]
-            x, y = x.unsqueeze(0).to(device), y.unsqueeze(0).to(device)  # (1, T, P) / (1, T, 2)
+        for x, y, lengths, mask in train_loader:
+            x, y, mask = x.to(device), y.to(device), mask.to(device)
             optimizer.zero_grad()
-            pred = model(x)
-            loss = loss_fn(pred, y)
+            pred = model(x, lengths)
+            masked_loss = loss_fn(pred, y)[mask]  # (n_real_timesteps, 2), padding excluded
+            loss = masked_loss.mean()
             loss.backward()
+            if grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
-            running += loss.item() * x.shape[1]
-            n_windows += x.shape[1]
+            running += loss.item() * masked_loss.shape[0]
+            n_windows += masked_loss.shape[0]
         train_loss = running / n_windows
 
         model.eval()
         running, n_windows = 0.0, 0
         val_preds, val_trues = [], []
         with torch.no_grad():
-            for idx in range(len(val_ds)):
-                x, y = val_ds[idx]
-                x, y = x.unsqueeze(0).to(device), y.unsqueeze(0).to(device)
-                pred = model(x)
-                running += loss_fn(pred, y).item() * x.shape[1]
-                n_windows += x.shape[1]
-                val_preds.append(pred.squeeze(0).cpu().numpy())
-                val_trues.append(y.squeeze(0).cpu().numpy())
+            for x, y, lengths, mask in val_loader:
+                x, y, mask = x.to(device), y.to(device), mask.to(device)
+                pred = model(x, lengths)
+                masked_loss = loss_fn(pred, y)[mask]
+                running += masked_loss.sum().item()
+                n_windows += masked_loss.shape[0]
+                val_preds.append(pred[mask].cpu().numpy())
+                val_trues.append(y[mask].cpu().numpy())
         val_loss = running / n_windows
         val_preds_cat = np.concatenate(val_preds)
         val_trues_cat = np.concatenate(val_trues)
